@@ -1,0 +1,14 @@
+{
+  "name": "hl-monitor",
+  "version": "1.0.0",
+  "description": "Hyperliquid 地址监控 + Telegram 通知",
+  "main": "monitor.js",
+  "scripts": {
+    "start": "node monitor.js",
+    "dev": "node --watch monitor.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ws": "^8.18.0"
+  }
+}
