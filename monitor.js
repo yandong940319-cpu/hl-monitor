@@ -1,269 +1,193 @@
 /**
  * Hyperliquid 地址监控 + Telegram 通知
- * 监控目标：开仓（fills）和挂单（orderUpdates）
+ * 功能：开仓/挂单实时通知 + 启动时持仓快照 + 多地址支持
  */
 
 const WebSocket = require("ws");
 const https = require("https");
 require("dotenv").config();
 
-// ─────────────────────────────────────────
-//  配置区（优先从 .env 读取）
-// ─────────────────────────────────────────
+function parseAddresses() {
+  const multi = process.env.TARGET_ADDRESSES || "";
+  const single = process.env.TARGET_ADDRESS || "";
+  const raw = multi || single;
+  return raw.split(",").map((a) => a.trim().toLowerCase()).filter((a) => a.length > 0);
+}
+
 const CONFIG = {
-  TARGET_ADDRESS: process.env.TARGET_ADDRESS || "0x5D2F4460Ac3514AdA79f5D9838916E508Ab39Bb7",
+  ADDRESSES: parseAddresses(),
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || "YOUR_BOT_TOKEN",
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || "YOUR_CHAT_ID",
   HL_WS_URL: "wss://api.hyperliquid.xyz/ws",
-  RECONNECT_DELAY_MS: 3000,   // 断线重连等待时间（ms）
+  RECONNECT_DELAY_MS: 3000,
   MAX_RECONNECT_DELAY_MS: 60000,
 };
 
-// ─────────────────────────────────────────
-//  工具函数
-// ─────────────────────────────────────────
+if (CONFIG.ADDRESSES.length === 0) {
+  console.error("未配置监控地址");
+  process.exit(1);
+}
+
 function log(level, msg) {
-  const ts = new Date().toISOString();
-  console.log(`[${ts}] [${level}] ${msg}`);
+  console.log(`[${new Date().toISOString()}] [${level}] ${msg}`);
 }
-
-/** 发送 Telegram 消息 */
-function sendTelegram(text) {
-  const body = JSON.stringify({
-    chat_id: CONFIG.TELEGRAM_CHAT_ID,
-    text,
-    parse_mode: "HTML",
-  });
-
-  const options = {
-    hostname: "api.telegram.org",
-    path: `/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`,
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Content-Length": Buffer.byteLength(body),
-    },
-  };
-
-  const req = https.request(options, (res) => {
-    if (res.statusCode !== 200) {
-      log("WARN", `Telegram 响应异常: ${res.statusCode}`);
-    }
-  });
-
-  req.on("error", (e) => log("ERROR", `Telegram 发送失败: ${e.message}`));
-  req.write(body);
-  req.end();
-}
-
-/** 格式化方向 */
+function shortAddr(addr) { return `${addr.slice(0,6)}...${addr.slice(-4)}`; }
+function fmt(n, d=4) { const num=parseFloat(n); if(isNaN(num)) return String(n); return num.toLocaleString("en-US",{maximumFractionDigits:d}); }
 function formatDir(dir) {
-  if (!dir) return "未知";
-  const d = dir.toLowerCase();
-  if (d.includes("open long") || d.includes("buy")) return "🟢 开多 (Long)";
-  if (d.includes("open short") || d.includes("sell")) return "🔴 开空 (Short)";
-  if (d.includes("close long")) return "🔵 平多 (Close Long)";
-  if (d.includes("close short")) return "🔵 平空 (Close Short)";
+  if(!dir) return "未知";
+  const d=dir.toLowerCase();
+  if(d.includes("open long")) return "🟢 开多 (Long)";
+  if(d.includes("open short")) return "🔴 开空 (Short)";
+  if(d.includes("close long")) return "🔵 平多 (Close Long)";
+  if(d.includes("close short")) return "🔵 平空 (Close Short)";
   return dir;
 }
+function formatSide(side) { return side==="B"?"🟢 买入 (Long)":"🔴 卖出 (Short)"; }
 
-/** 格式化挂单方向 */
-function formatSide(side) {
-  return side === "B" ? "🟢 买入 (Long)" : "🔴 卖出 (Short)";
+function sendTelegram(text) {
+  const body=JSON.stringify({chat_id:CONFIG.TELEGRAM_CHAT_ID,text,parse_mode:"HTML",disable_web_page_preview:true});
+  const options={hostname:"api.telegram.org",path:`/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`,method:"POST",headers:{"Content-Type":"application/json","Content-Length":Buffer.byteLength(body)}};
+  const req=https.request(options,(res)=>{if(res.statusCode!==200)log("WARN",`Telegram响应异常:${res.statusCode}`);});
+  req.on("error",(e)=>log("ERROR",`Telegram发送失败:${e.message}`));
+  req.write(body); req.end();
 }
 
-/** 格式化数字（保留合理小数位） */
-function fmt(n, decimals = 4) {
-  const num = parseFloat(n);
-  if (isNaN(num)) return n;
-  return num.toLocaleString("en-US", { maximumFractionDigits: decimals });
+function fetchPositions(address) {
+  return new Promise((resolve,reject)=>{
+    const body=JSON.stringify({type:"clearinghouseState",user:address});
+    const options={hostname:"api.hyperliquid.xyz",path:"/info",method:"POST",headers:{"Content-Type":"application/json","Content-Length":Buffer.byteLength(body)}};
+    const req=https.request(options,(res)=>{
+      let data="";
+      res.on("data",(chunk)=>(data+=chunk));
+      res.on("end",()=>{try{resolve(JSON.parse(data));}catch(e){reject(e);}});
+    });
+    req.on("error",reject); req.write(body); req.end();
+  });
 }
 
-// ─────────────────────────────────────────
-//  消息格式化
-// ─────────────────────────────────────────
-
-/** 开仓通知 */
-function buildFillMessage(fill) {
-  const time = new Date(fill.time).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
-  const isOpen = fill.dir && fill.dir.toLowerCase().includes("open");
-  const action = isOpen ? "🚀 <b>开仓成交</b>" : "📤 <b>平仓成交</b>";
-
-  return `${action}
-━━━━━━━━━━━━━━━━━━━━
-🪙 资产：<b>${fill.coin}</b>
-📊 方向：${formatDir(fill.dir)}
-💰 成交价：<b>$${fmt(fill.px)}</b>
-📦 数量：<b>${fmt(fill.sz)} ${fill.coin}</b>
-💵 手续费：${fmt(fill.fee)} ${fill.feeToken || "USDC"}
-🕐 时间：${time}
-🔗 <a href="https://hyperdash.com/address/${CONFIG.TARGET_ADDRESS}">查看地址</a>
-━━━━━━━━━━━━━━━━━━━━
-📍 地址：<code>${CONFIG.TARGET_ADDRESS.slice(0, 10)}...${CONFIG.TARGET_ADDRESS.slice(-6)}</code>`;
+function buildPositionsMessage(address,state) {
+  const positions=(state.assetPositions||[]).filter((p)=>parseFloat(p.position?.szi||0)!==0);
+  const accountValue=fmt(state.marginSummary?.accountValue||0,2);
+  const addrLine=CONFIG.ADDRESSES.length>1?`\n📍 地址：<code>${shortAddr(address)}</code>`:"";
+  if(positions.length===0) {
+    return `📊 <b>当前持仓快照</b>${addrLine}\n━━━━━━━━━━━━━━━━━━━━\n💼 账户净值：<b>$${accountValue}</b>\n📭 当前无持仓`;
+  }
+  const posLines=positions.map((p)=>{
+    const pos=p.position;
+    const size=parseFloat(pos.szi);
+    const side=size>0?"🟢 多":"🔴 空";
+    const pnl=parseFloat(pos.unrealizedPnl||0);
+    const pnlStr=(pnl>=0?"+":"")+"$"+fmt(pnl,2);
+    const lev=pos.leverage?.value?`${pos.leverage.value}x`:"-";
+    return `  • <b>${pos.coin}</b> ${side} | 入场 $${fmt(pos.entryPx,4)} | 数量 ${fmt(Math.abs(size),4)} | 杠杆 ${lev} | 浮盈 ${pnlStr}`;
+  });
+  return `📊 <b>当前持仓快照</b>${addrLine}\n━━━━━━━━━━━━━━━━━━━━\n💼 账户净值：<b>$${accountValue}</b>\n📈 持仓数量：${positions.length} 个\n\n${posLines.join("\n")}\n━━━━━━━━━━━━━━━━━━━━\n🕐 ${new Date().toLocaleString("zh-CN",{timeZone:"Asia/Shanghai"})}`;
 }
 
-/** 挂单通知 */
-function buildOrderMessage(order) {
-  const time = new Date(order.timestamp).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
-  const tpsl = order.isPositionTpsl ? " (TP/SL)" : "";
-  const orderTypeLabel = order.orderType || order.tif || "Limit";
-
-  return `📋 <b>新挂单${tpsl}</b>
-━━━━━━━━━━━━━━━━━━━━
-🪙 资产：<b>${order.coin}</b>
-📊 方向：${formatSide(order.side)}
-💰 挂单价：<b>$${fmt(order.limitPx)}</b>
-📦 数量：<b>${fmt(order.origSz || order.sz)} ${order.coin}</b>
-🏷️ 类型：${orderTypeLabel}
-🕐 时间：${time}
-🆔 订单ID：<code>${order.oid}</code>
-🔗 <a href="https://hyperdash.com/address/${CONFIG.TARGET_ADDRESS}">查看地址</a>
-━━━━━━━━━━━━━━━━━━━━
-📍 地址：<code>${CONFIG.TARGET_ADDRESS.slice(0, 10)}...${CONFIG.TARGET_ADDRESS.slice(-6)}</code>`;
-}
-
-// ─────────────────────────────────────────
-//  事件处理
-// ─────────────────────────────────────────
-
-/** 处理 userFills 推送 */
-function handleFills(fills) {
-  if (!Array.isArray(fills)) fills = [fills];
-  for (const item of fills) {
-    const fill = item.fill || item;
-    if (!fill.coin) continue;
-
-    const isOpen = fill.dir && fill.dir.toLowerCase().includes("open");
-    log("INFO", `成交: ${fill.coin} | ${fill.dir} | 价格: ${fill.px} | 数量: ${fill.sz}`);
-
-    // 只通知开仓，平仓可按需注释/取消注释
-    if (isOpen) {
-      sendTelegram(buildFillMessage(fill));
-    }
-    // 如需平仓也通知，去掉下面注释：
-    // else { sendTelegram(buildFillMessage(fill)); }
+async function sendAllPositions() {
+  for(const addr of CONFIG.ADDRESSES) {
+    try{log("INFO",`拉取持仓:${addr}`);const state=await fetchPositions(addr);sendTelegram(buildPositionsMessage(addr,state));}
+    catch(e){log("ERROR",`获取持仓失败${addr}:${e.message}`);}
+    if(CONFIG.ADDRESSES.length>1) await new Promise((r)=>setTimeout(r,1000));
   }
 }
 
-/** 处理 orderUpdates 推送 */
-function handleOrderUpdates(orders) {
-  if (!Array.isArray(orders)) orders = [orders];
-  for (const item of orders) {
-    const order = item.order || item;
-    const status = item.status || "";
+function buildFillMessage(fill,address) {
+  const time=new Date(fill.time).toLocaleString("zh-CN",{timeZone:"Asia/Shanghai"});
+  const isOpen=fill.dir&&fill.dir.toLowerCase().includes("open");
+  const action=isOpen?"🚀 <b>开仓成交</b>":"📤 <b>平仓成交</b>";
+  const addrLine=CONFIG.ADDRESSES.length>1?`\n📍 地址：<code>${shortAddr(address)}</code>`:"";
+  return `${action}${addrLine}\n━━━━━━━━━━━━━━━━━━━━\n🪙 资产：<b>${fill.coin}</b>\n📊 方向：${formatDir(fill.dir)}\n💰 成交价：<b>$${fmt(fill.px)}</b>\n📦 数量：<b>${fmt(fill.sz)} ${fill.coin}</b>\n💵 手续费：${fmt(fill.fee)} ${fill.feeToken||"USDC"}\n🕐 时间：${time}\n🔗 <a href="https://hyperdash.com/address/${address}">查看地址</a>`;
+}
 
-    if (!order.coin) continue;
+function buildOrderMessage(order,address) {
+  const time=new Date(order.timestamp).toLocaleString("zh-CN",{timeZone:"Asia/Shanghai"});
+  const tpsl=order.isPositionTpsl?" (TP/SL)":"";
+  const addrLine=CONFIG.ADDRESSES.length>1?`\n📍 地址：<code>${shortAddr(address)}</code>`:"";
+  return `📋 <b>新挂单${tpsl}</b>${addrLine}\n━━━━━━━━━━━━━━━━━━━━\n🪙 资产：<b>${order.coin}</b>\n📊 方向：${formatSide(order.side)}\n💰 挂单价：<b>$${fmt(order.limitPx)}</b>\n📦 数量：<b>${fmt(order.origSz||order.sz)} ${order.coin}</b>\n🏷️ 类型：${order.orderType||order.tif||"Limit"}\n🕐 时间：${time}\n🆔 订单ID：<code>${order.oid}</code>\n🔗 <a href="https://hyperdash.com/address/${address}">查看地址</a>`;
+}
 
-    // 只处理新挂单（open 状态），忽略快照和已成交/已取消
-    if (status === "open") {
-      log("INFO", `挂单: ${order.coin} | ${order.side === "B" ? "Buy" : "Sell"} | 价格: ${order.limitPx} | 数量: ${order.origSz || order.sz}`);
-      sendTelegram(buildOrderMessage(order));
+function handleFills(fills,address) {
+  if(!Array.isArray(fills)) fills=[fills];
+  for(const item of fills) {
+    const fill=item.fill||item;
+    if(!fill.coin) continue;
+    const isOpen=fill.dir&&fill.dir.toLowerCase().includes("open");
+    log("INFO",`[${shortAddr(address)}] 成交:${fill.coin}|${fill.dir}|$${fill.px}|${fill.sz}`);
+    if(isOpen) sendTelegram(buildFillMessage(fill,address));
+  }
+}
+
+function handleOrderUpdates(orders,address) {
+  if(!Array.isArray(orders)) orders=[orders];
+  for(const item of orders) {
+    const order=item.order||item;
+    const status=item.status||"";
+    if(!order.coin) continue;
+    if(status==="open") {
+      log("INFO",`[${shortAddr(address)}] 挂单:${order.coin}|${order.side==="B"?"Buy":"Sell"}|$${order.limitPx}`);
+      sendTelegram(buildOrderMessage(order,address));
     }
   }
 }
 
-// ─────────────────────────────────────────
-//  WebSocket 连接管理
-// ─────────────────────────────────────────
-let reconnectDelay = CONFIG.RECONNECT_DELAY_MS;
-let ws = null;
-let pingInterval = null;
+let reconnectDelay=CONFIG.RECONNECT_DELAY_MS;
+let ws=null;
+let pingInterval=null;
 
 function connect() {
-  log("INFO", `正在连接 Hyperliquid WebSocket...`);
-  ws = new WebSocket(CONFIG.HL_WS_URL);
-
-  ws.on("open", () => {
-    log("INFO", "WebSocket 已连接 ✅");
-    reconnectDelay = CONFIG.RECONNECT_DELAY_MS; // 重置重连延迟
-
-    const addr = CONFIG.TARGET_ADDRESS.toLowerCase();
-
-    // 订阅：开仓成交
-    ws.send(JSON.stringify({
-      method: "subscribe",
-      subscription: { type: "userFills", user: addr },
-    }));
-
-    // 订阅：挂单更新
-    ws.send(JSON.stringify({
-      method: "subscribe",
-      subscription: { type: "orderUpdates", user: addr },
-    }));
-
-    log("INFO", `✅ 已订阅地址: ${addr}`);
-
-    // 心跳 ping（每 30s），防止连接超时断开
-    pingInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.ping();
-      }
-    }, 30_000);
-
-    // 启动通知
-    sendTelegram(`🟢 <b>监控已启动</b>
-📍 监控地址：<code>${CONFIG.TARGET_ADDRESS}</code>
-🔔 将实时通知开仓和挂单操作`);
+  log("INFO","正在连接 Hyperliquid WebSocket...");
+  ws=new WebSocket(CONFIG.HL_WS_URL);
+  ws.on("open",async()=>{
+    log("INFO","WebSocket 已连接 ✅");
+    reconnectDelay=CONFIG.RECONNECT_DELAY_MS;
+    for(const addr of CONFIG.ADDRESSES) {
+      ws.send(JSON.stringify({method:"subscribe",subscription:{type:"userFills",user:addr}}));
+      ws.send(JSON.stringify({method:"subscribe",subscription:{type:"orderUpdates",user:addr}}));
+      log("INFO",`✅ 已订阅:${addr}`);
+    }
+    pingInterval=setInterval(()=>{if(ws.readyState===WebSocket.OPEN)ws.ping();},30000);
+    const addrList=CONFIG.ADDRESSES.map((a,i)=>`  ${i+1}. <code>${a}</code>`).join("\n");
+    sendTelegram(`🟢 <b>监控已启动</b>\n━━━━━━━━━━━━━━━━━━━━\n📡 监控地址（${CONFIG.ADDRESSES.length} 个）：\n${addrList}\n🔔 实时通知开仓和挂单操作\n📊 正在拉取持仓快照...`);
+    await sendAllPositions();
   });
-
-  ws.on("message", (data) => {
-    let msg;
-    try {
-      msg = JSON.parse(data);
-    } catch {
-      return;
+  ws.on("message",(data)=>{
+    let msg;try{msg=JSON.parse(data);}catch{return;}
+    const channel=msg.channel;
+    if(channel==="subscriptionResponse"||channel==="pong") return;
+    if(channel==="userFills"){
+      const payload=msg.data;
+      if(payload?.isSnapshot) return;
+      const fills=payload?.fills||[];
+      if(fills.length===0) return;
+      const addr=(payload?.user||CONFIG.ADDRESSES[0]).toLowerCase();
+      handleFills(fills,addr);
     }
-
-    const channel = msg.channel;
-
-    // 忽略订阅确认和心跳
-    if (channel === "subscriptionResponse" || channel === "pong") return;
-
-    if (channel === "userFills") {
-      const payload = msg.data;
-      // isSnapshot: true 时是历史数据，可忽略
-      if (payload?.isSnapshot) return;
-      if (payload?.fills) handleFills(payload.fills);
-    }
-
-    if (channel === "orderUpdates") {
-      const payload = msg.data;
-      if (Array.isArray(payload)) {
-        handleOrderUpdates(payload);
-      }
+    if(channel==="orderUpdates"){
+      const payload=msg.data;
+      if(!Array.isArray(payload)||payload.length===0) return;
+      const addr=(payload[0]?.order?.user||CONFIG.ADDRESSES[0]).toLowerCase();
+      handleOrderUpdates(payload,addr);
     }
   });
-
-  ws.on("ping", () => ws.pong());
-
-  ws.on("error", (err) => {
-    log("ERROR", `WebSocket 错误: ${err.message}`);
-  });
-
-  ws.on("close", (code, reason) => {
+  ws.on("ping",()=>ws.pong());
+  ws.on("error",(err)=>log("ERROR",`WebSocket错误:${err.message}`));
+  ws.on("close",(code)=>{
     clearInterval(pingInterval);
-    log("WARN", `WebSocket 断开 (code=${code}), ${reconnectDelay / 1000}s 后重连...`);
-    setTimeout(() => {
-      reconnectDelay = Math.min(reconnectDelay * 2, CONFIG.MAX_RECONNECT_DELAY_MS);
-      connect();
-    }, reconnectDelay);
+    log("WARN",`WebSocket断开(code=${code}),${reconnectDelay/1000}s后重连...`);
+    setTimeout(()=>{reconnectDelay=Math.min(reconnectDelay*2,CONFIG.MAX_RECONNECT_DELAY_MS);connect();},reconnectDelay);
   });
 }
 
-// ─────────────────────────────────────────
-//  启动
-// ─────────────────────────────────────────
-log("INFO", "=".repeat(50));
-log("INFO", "Hyperliquid 地址监控启动");
-log("INFO", `目标地址: ${CONFIG.TARGET_ADDRESS}`);
-log("INFO", "=".repeat(50));
-
+log("INFO","=".repeat(50));
+log("INFO","Hyperliquid 地址监控启动");
+CONFIG.ADDRESSES.forEach((a,i)=>log("INFO",`  [${i+1}] ${a}`));
+log("INFO","=".repeat(50));
 connect();
 
-// 优雅退出
-process.on("SIGINT", () => {
-  log("INFO", "收到退出信号，正在关闭...");
-  sendTelegram(`🔴 <b>监控已停止</b>\n📍 地址：<code>${CONFIG.TARGET_ADDRESS}</code>`);
-  if (ws) ws.close();
+process.on("SIGINT",()=>{
+  log("INFO","收到退出信号，正在关闭...");
+  sendTelegram(`🔴 <b>监控已停止</b>\n📡 已停止监控 ${CONFIG.ADDRESSES.length} 个地址`);
+  if(ws) ws.close();
   process.exit(0);
 });
