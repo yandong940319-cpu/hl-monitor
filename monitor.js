@@ -100,7 +100,7 @@ function buildPositionsMessage(address, state, openOrders, label="📊 <b>持仓
       const roe=pos.returnOnEquity?`ROE ${(parseFloat(pos.returnOnEquity)*100).toFixed(2)}%`:"";
       const pnlStr=(pnl>=0?"+":"")+"$"+fmt(pnl,2);
       const lev=pos.leverage?.value?`${pos.leverage.value}x`:"-";
-      const liqPx=pos.liquidationPx?`$${fmt(pos.liquidationPx,2)}":"-";
+      const liqPx=pos.liquidationPx?`$${fmt(pos.liquidationPx, 2)}`;
       return `  <b>${pos.coin}</b> ${side} ${lev}\n  入场 $${fmt(pos.entryPx,4)} | 数量 ${fmt(Math.abs(size),4)}\n  浮盈 <b>${pnlStr}</b> ${roe}\n  强平价 ${liqPx}`;
     }).join("\n\n");
   }
