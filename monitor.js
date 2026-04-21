@@ -34,6 +34,9 @@ if (CONFIG.ADDRESSES.length === 0) {
 
 var positionCache = {};
 
+// 关键修复：标记是否已经拉取过初始持仓，重连不再强制推送
+var initialPositionsFetched = false;
+
 // 工具
 function log(level, msg) {
   console.log("[" + new Date().toISOString() + "] [" + level + "] " + msg);
@@ -185,6 +188,7 @@ async function checkAndSendPositions(address, opts) {
   }
 }
 
+// 启动时只执行一次
 async function sendInitialPositions() {
   for (var i = 0; i < CONFIG.ADDRESSES.length; i++) {
     await checkAndSendPositions(CONFIG.ADDRESSES[i], { forceSend: true, label: "📊 <b>持仓快照（启动）</b>" });
@@ -193,7 +197,7 @@ async function sendInitialPositions() {
 }
 
 async function dailyReport() {
-  log("INFO", "执行每日日报...");
+  log("INFO", "每日日报...");
   var anyChanged = false;
   for (var i = 0; i < CONFIG.ADDRESSES.length; i++) {
     var r = await checkAndSendPositions(CONFIG.ADDRESSES[i], { forceSend: false, label: "📅 <b>每日持仓日报 (10:00)</b>" });
@@ -270,17 +274,26 @@ function connect() {
   ws = new WebSocket(CONFIG.HL_WS_URL);
 
   ws.on("open", async function() {
-    log("INFO", "WebSocket 已连接 OK");
+    log("INFO", "WebSocket 已连接");
     reconnectDelay = CONFIG.RECONNECT_DELAY_MS;
+
     CONFIG.ADDRESSES.forEach(function(addr) {
       ws.send(JSON.stringify({ method: "subscribe", subscription: { type: "userFills", user: addr } }));
       ws.send(JSON.stringify({ method: "subscribe", subscription: { type: "orderUpdates", user: addr } }));
       log("INFO", "subscribed: " + addr);
     });
+
     pingInterval = setInterval(function() { if (ws.readyState === WebSocket.OPEN) ws.ping(); }, 30000);
-    var addrList = CONFIG.ADDRESSES.map(function(a, i) { return "  " + (i + 1) + ". <code>" + a + "</code>"; }).join("\n");
-    sendTelegram("🟢 <b>监控已启动</b>\n━━━━━━━━━━━━━━━━━━━━\n📡 监控地址（" + CONFIG.ADDRESSES.length + "个）：\n" + addrList + "\n🔔 实时通知：开仓、挂单、持仓变化\n📅 每日 10:00 推送日报\n📊 正在拉取初始持仓...");
-    await sendInitialPositions();
+
+    // 关键修复：只在第一次连接时推送初始持仓，重连不再推送
+    if (!initialPositionsFetched) {
+      initialPositionsFetched = true;
+      var addrList = CONFIG.ADDRESSES.map(function(a, i) { return "  " + (i + 1) + ". <code>" + a + "</code>"; }).join("\n");
+      sendTelegram("🟢 <b>监控已启动</b>\n━━━━━━━━━━━━━━━━━━━━\n📡 监控地址（" + CONFIG.ADDRESSES.length + "个）：\n" + addrList + "\n🔔 实时通知：开仓、挂单、持仓变化\n📅 每日 10:00 推送日报\n📊 正在拉取初始持仓...");
+      await sendInitialPositions();
+    } else {
+      log("INFO", "WS 重连，跳过初始持仓推送");
+    }
   });
 
   ws.on("message", function(data) {
